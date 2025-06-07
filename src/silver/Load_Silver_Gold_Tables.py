@@ -1,0 +1,180 @@
+# Databricks notebook source
+with open("/tmp/requirements.txt", "w") as f :
+    f.write("""
+pytest>=7.4
+typing_extensions>=4.5
+pytest-mock
+coverage
+""".strip())
+
+# COMMAND ----------
+
+# MAGIC %pip install -r /tmp/requirements.txt
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# MAGIC %run /Users/shakj9090@gmail.com/src/transform/Enrich_Silver_Gold_Tables
+
+# COMMAND ----------
+
+conftest_code = """
+import sys
+import pytest
+from pyspark.sql import SparkSession
+
+@pytest.fixture(scope = "session")
+def spark():
+    spark = getattr(sys.modules["__main__"], "spark", None)
+
+    if spark is None:
+        try:
+           spark = SparkSession.getActiveSession()
+        except Exception:
+           spark = None
+
+
+    if spark is None :
+       spark = SparkSession.builder.master("local[*]").appName("pytest-context").getOrCreate()    
+
+    return spark
+
+"""
+
+with open("/databricks/driver/conftest.py", "w") as f:
+    f.write(conftest_code)
+
+
+# COMMAND ----------
+
+test_code ="""
+import pytest
+from pyspark.sql import Row
+from conftest import spark
+from pyspark.sql import functions as F
+
+@pytest.fixture
+def bronze_customer_df(spark):
+    return spark.read.format("delta").load("/user/hive/warehouse/bronze_customer")
+
+@pytest.fixture
+def bronze_product_df(spark):
+    return spark.read.format("delta").load("/user/hive/warehouse/bronze_products")
+
+@pytest.fixture
+def bronze_orders_df(spark):
+    return spark.read.format("delta").load("/user/hive/warehouse/bronze_orders")   
+
+
+def test_col_trans_customer(bronze_customer_df):
+    from __main__ import enrich_customer_data
+    enriched_df = enrich_customer_data(bronze_customer_df)
+    expected_columns = {
+        "Customer_PK", "Customer_ID", "Customer_Name","Email","Phone", "Address_Line1","Address_Line2","Segment","Country","City","State","Postal_Code","Region","Customer_Name_Bad","Phone_Bad"
+    }   
+    assert set(enriched_df.columns) == expected_columns
+
+
+def test_validate_bad_records(bronze_customer_df):
+    from __main__ import enrich_customer_data
+    enriched_df = enrich_customer_data(bronze_customer_df)
+    bad_df = enriched_df.filter(
+        (F.col("Customer_Name_Bad") != "") | (F.col("Phone_Bad") == True) 
+    )
+
+    bad_rows = bad_df.collect()
+
+    assert all(r.Customer_Name_Bad or r.Phone_Bad for r in bad_rows), "Invalid records not detected"
+
+    for row in bad_rows:
+        print(f"Bad Record : ID ={row.Customer_ID}, Name = {row.Customer_Name}, Phone = {row.Phone}" )
+
+
+def test_col_trans_prod(bronze_product_df):
+    from __main__ import enrich_product_data
+    enriched_prod_df = enrich_product_data(bronze_product_df)
+    expected_columns = {"Product_PK","Product_ID","Category","Sub_Category","Product_Name"}
+    assert set(enriched_prod_df.columns) == expected_columns
+
+"""
+
+
+with open("/databricks/driver/test_enrich.py", "w") as f:
+    f.write(test_code)  
+
+# COMMAND ----------
+
+#import os
+import pytest
+
+result = pytest.main(["/databricks/driver/test_enrich.py", "-v", "-s"])
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+
+bronze_cust_df = spark.read.format("delta").load("/user/hive/warehouse/bronze_customer")
+bronze_prod_df = spark.read.format("delta").load("/user/hive/warehouse/bronze_products")
+bronze_order_df = spark.read.format("delta").load("/user/hive/warehouse/bronze_orders")   
+
+print("No of partitions:" , bronze_order_df.rdd.getNumPartitions())
+
+enriched_cust_df = enrich_customer_data(bronze_cust_df)
+enriched_prod_df = enrich_product_data(bronze_prod_df)
+
+print("No of partitions:" , enriched_cust_df.rdd.getNumPartitions())
+print("No of partitions:" , enriched_prod_df.rdd.getNumPartitions())
+
+valid_cust_df = enriched_cust_df.filter( (F.col("Customer_Name_Bad") == "") & (F.col("Phone_Bad") == False) ) \
+.select("Customer_PK", "Customer_ID", "Customer_Name","Email","Phone", "Address_Line1","Address_Line2","Segment","Country","City","State","Postal_Code","Region")
+
+#Filtering the bad_cust_df for predicate push down approach
+bad_cust_df = enriched_cust_df.filter( (F.col("Customer_Name_Bad") == True) | (F.col("Phone_Bad") == True) )
+
+enriched_ord_df = enrich_order_data(bronze_order_df,valid_cust_df,enriched_prod_df)
+
+#Caching enriched_ord_df to avoid repitive recomputation
+enriched_ord_df.cache()
+
+#To look into the behaviour of AQE 
+enriched_ord_df.explain(extended=True)
+
+# display(enriched_ord_df)
+print("No of partitions:" , enriched_ord_df.rdd.getNumPartitions())
+
+# COMMAND ----------
+
+cleaned_df = valid_cust_df.drop("Customer_Name_Bad","Phone_Bad")
+
+# COMMAND ----------
+
+spark.sql("DROP TABLE IF EXISTS silver_customer")
+spark.sql("DROP TABLE IF EXISTS bad_silver_customer")
+spark.sql("DROP TABLE IF EXISTS gold_orders")
+
+
+cleaned_df.write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable("silver_customer")
+bad_cust_df.write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable("bad_silver_customer")
+enriched_prod_df.write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable("silver_products")
+enriched_ord_df.write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable("gold_orders")
+
+
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC OPTIMIZE gold_orders ZORDER BY (ROW_ID)
+# MAGIC
+
+# COMMAND ----------
+
+spark.sql("DROP TABLE IF EXISTS gold_profit_agg")
+
+profit_agg_df = enriched_ord_df.withColumn("Year", F.year("Order_Date")) \
+    .groupBy("Year", "Category", "Sub_Category", "Customer_Name") \
+    .agg(F.sum("Profit").alias("Profit"))
+
+profit_agg_df.write.format("delta").mode("overwrite").option("mergeSchema", "true").partitionBy("Year").saveAsTable("gold_profit_agg")    
