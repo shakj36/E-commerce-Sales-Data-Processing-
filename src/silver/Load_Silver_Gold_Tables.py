@@ -99,6 +99,30 @@ def test_col_trans_prod(bronze_product_df):
     expected_columns = {"Product_PK","Product_ID","Category","Sub_Category","Product_Name"}
     assert set(enriched_prod_df.columns) == expected_columns
 
+def test_low_profit_customer(bronze_orders_df,bronze_customer_df,bronze_product_df):
+    from __main__ import enrich_order_data,enrich_customer_data,enrich_product_data
+    # from __main__ import enrich_customer_data
+    # from __main__ import enrich_product_data
+
+    enriched_cust_df = enrich_customer_data(bronze_customer_df)
+    enriched_prod_df = enrich_product_data(bronze_product_df)   
+
+    enriched_cust_filter_df = enriched_cust_df.filter( (F.col("Customer_Name_Bad") == "") & (F.col("Phone_Bad") == False) ) \
+    .select("Customer_PK", "Customer_ID", "Customer_Name","Email","Phone", "Address_Line1","Address_Line2","Segment","Country","City","State","Postal_Code","Region")
+
+    enriched_orders_df = enrich_order_data(bronze_orders_df,enriched_cust_filter_df,enriched_prod_df)
+
+    low_profit_df = enriched_orders_df.withColumn("Profit_Percent", (F.col("Profit") / F.col("Price")) * 100 ) \
+                    .filter(F.col("Profit_Percent") < 10)
+
+    low_profit_rows = low_profit_df.select("Customer_Name","Profit_Percent").collect()
+
+    assert all(row.Profit_Percent < 10 for row in low_profit_rows), "Some Customers have profit > 10%"
+
+    for row in low_profit_rows:
+         print(f"Customer: {row.Customer_Name}, Profit_Percent : {row.Profit_Percent}" )
+
+
 """
 
 
