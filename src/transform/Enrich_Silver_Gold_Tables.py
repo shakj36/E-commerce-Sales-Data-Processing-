@@ -20,15 +20,28 @@
 
 # COMMAND ----------
 
-
+import logging
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+  handler = logging.StreamHandler()
+  formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s ')
+  handler.setFormatter(formatter)
+  logger.addHandler(handler)
 
 address_parts = F.split("Address", ",")
 window_cust = Window.orderBy("Customer_ID")
 window_prod = Window.orderBy("Product_ID")
 
+
+
 def enrich_customer_data(df):
+  try:
+    logger.info("Starting enrich_customer_data transformation..")
+
     return df \
       .withColumn("Customer_PK", F.row_number().over(window_cust)) \
       .withColumn("Customer_Name", F.trim(F.regexp_replace("Customer_Name", r"[^\w\s]", ""))) \
@@ -39,16 +52,35 @@ def enrich_customer_data(df):
       .select(
         "Customer_PK", "Customer_ID", "Customer_Name","Email","Phone", "Address_Line1","Address_Line2","Segment","Country","City","State","Postal_Code","Region","Customer_Name_Bad","Phone_Bad"
       )    
+    logger.info("Enrich Customer data loaded")
+
+  except Exception as e:
+    logger.exception("Error occured")  
+    raise
+
 
 
 def enrich_product_data(df):
+  try:
+    logger.info("Starting enrich_product_data transformation..")
+
     return df \
       .withColumn("Product_PK", F.row_number().over(window_prod)) \
       .select(
            "Product_PK","Product_ID","Category","Sub_Category","Product_Name"
       )  
+    logger.info("Enrich Product data loaded")
+
+  except Exception as e:
+    logger.exception("Error occured")  
+    raise 
+
+
 
 def enrich_order_data(orders_df, enriched_customers_df, enriched_products_df):
+  try:
+    logger.info("Starting enrich_order_data transformation..")
+
     refined_orders = orders_df \
       .withColumn("Profit", F.round(F.col("Profit"), 2)) \
       .withColumn("Order_Date", F.to_date(F.col("Order_Date"), "d/M/yyyy"))  \
@@ -62,5 +94,11 @@ def enrich_order_data(orders_df, enriched_customers_df, enriched_products_df):
       )  
 
     return enriched_orders
+  
+    logger.info("Enrich Order data loaded")
+
+  except Exception as e:
+    logger.exception("Error occured")  
+    raise 
 
       
